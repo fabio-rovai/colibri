@@ -30,6 +30,16 @@ OMPC    =
 OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
+# i8mm (SMMLA) — OPT-IN (I8MM=1): Apple clang does not define
+# __ARM_FEATURE_MATMUL_INT8 without -march. Measured on M3 Max the 2x2 SMMLA tile
+# is 10-25% SLOWER than the SDOT path (SMMLA and SDOT issue at the same rate on
+# Apple cores, and building the 2x8 operands costs shuffles), so it stays off by
+# default on Darwin. The expected winners are Cortex-X/Neoverse (GB10/Grace),
+# where -march=native already defines the macro on the Linux branch.
+I8MM   ?= 0
+ifeq ($(I8MM),1)
+CFLAGS += -march=armv8.6-a+i8mm
+endif
 LDFLAGS = -lm $(OMPL)
 EXE     =
 else ifneq ($(IS_WIN),)
@@ -90,7 +100,7 @@ CUDA_ARCH ?= native
 NVCCFLAGS ?= -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler=-Wall,-Wextra
 PYTHON    ?= python3
 CUDA_OBJ  =
-TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_i4_acc512$(EXE)
+TEST_BINS = tests/test_json$(EXE) tests/test_st$(EXE) tests/test_tier$(EXE) tests/test_grammar$(EXE) tests/test_decode_batch$(EXE) tests/test_idot$(EXE) tests/test_matmul_idot$(EXE) tests/test_i4_acc512$(EXE)
 
 # Windows CUDA DLL path: host links the loader, NOT cudart.
 ifneq ($(IS_WIN),)
@@ -199,6 +209,9 @@ tests/test_decode_batch$(EXE): tests/test_decode_batch.c decode_batch.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_idot$(EXE): tests/test_idot.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
+	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
+
+tests/test_matmul_idot$(EXE): tests/test_matmul_idot.c glm.c st.h json.h tok.h tok_unicode.h compat.h grammar.h tier.h
 	$(CC) $(CFLAGS) $< -o $@ $(LDFLAGS)
 
 tests/test_i4_acc512$(EXE): tests/test_i4_acc512.c

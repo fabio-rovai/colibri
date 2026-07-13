@@ -445,6 +445,8 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "avx-vnni"
 #elif defined(__AVX2__)
 #define IDOT_KERNEL "avx2"
+#elif defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+#define IDOT_KERNEL "neon+i8mm"
 #elif defined(__ARM_NEON)
 #define IDOT_KERNEL "neon"
 #elif defined(__VSX__)
@@ -453,6 +455,9 @@ static void matmul_i2(float *y, const float *x, const uint8_t *q2, const float *
 #define IDOT_KERNEL "scalar"
 #endif
 static int g_idot=1;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+static int g_i8mm=1;  /* I8MM=0 falls back to the per-row SDOT path (A/B kill-switch). */
+#endif
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
 static int g_i4s=1;   /* SDOT presente: int4 IDOT conviene anche a S=1 (decode). Misurato
                        * su Apple M-series: +14%%, expert-matmul -16%%. EN: with SDOT, int4
@@ -667,8 +672,85 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     if(i<I){ uint8_t b=w4[i>>1]; sum+=((int)(b&0xF)-8)*x[i]; }
     return sum;
 }
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+/* ===================== i8mm: 2x2 SMMLA tile (S>=2) =====================
+ * vmmlaq_s32(acc, a, b): acc[2x2] += a(2x8) * b(2x8)^T, s8 x s8 accumulated
+ * DIRECTLY into s32 — no sign trick, no 16-bit intermediate, exact by
+ * construction. One instruction does 32 MACs vs SDOT's 16, so the multi-row
+ * matmuls (per-expert prefill groups, MTP/grammar verify batches, server decode
+ * batches) get double the theoretical peak. At S=1 half the SMMLA lanes would
+ * be wasted: decode stays on the per-row SDOT kernels. */
+static inline void dot2x2_i8i8(const int8_t *w0,const int8_t *w1,
+                               const int8_t *x0,const int8_t *x1,int I,int32_t out[4]){
+    int32x4_t acc=vdupq_n_s32(0); int i=0;
+    for(;i+16<=I;i+=16){
+        int8x16_t a0=vld1q_s8(x0+i), a1=vld1q_s8(x1+i);
+        int8x16_t b0=vld1q_s8(w0+i), b1=vld1q_s8(w1+i);
+        acc=vmmlaq_s32(acc,vcombine_s8(vget_low_s8(a0), vget_low_s8(a1)),
+                           vcombine_s8(vget_low_s8(b0), vget_low_s8(b1)));
+        acc=vmmlaq_s32(acc,vcombine_s8(vget_high_s8(a0),vget_high_s8(a1)),
+                           vcombine_s8(vget_high_s8(b0),vget_high_s8(b1)));
+    }
+    vst1q_s32(out,acc);
+    for(;i<I;i++){ out[0]+=(int32_t)x0[i]*w0[i]; out[1]+=(int32_t)x0[i]*w1[i];
+                   out[2]+=(int32_t)x1[i]*w0[i]; out[3]+=(int32_t)x1[i]*w1[i]; }
+}
+/* int4: same nibble->s8 [-8,7] unpack as dot_i4i8's NEON branch, then 4 SMMLAs
+ * cover 32 K-elements of the 2x2 tile. */
+static inline void dot2x2_i4i8(const uint8_t *w40,const uint8_t *w41,
+                               const int8_t *x0,const int8_t *x1,int I,int32_t out[4]){
+    const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
+    int32x4_t acc=vdupq_n_s32(0); int i=0;
+    for(;i+32<=I;i+=32){
+        uint8x16_t byA=vld1q_u8(w40+(i>>1)), byB=vld1q_u8(w41+(i>>1));
+        uint8x16x2_t zA=vzipq_u8(vandq_u8(byA,m4q),vshrq_n_u8(byA,4));
+        uint8x16x2_t zB=vzipq_u8(vandq_u8(byB,m4q),vshrq_n_u8(byB,4));
+        int8x16_t wA0=vsubq_s8(vreinterpretq_s8_u8(zA.val[0]),b8q);
+        int8x16_t wA1=vsubq_s8(vreinterpretq_s8_u8(zA.val[1]),b8q);
+        int8x16_t wB0=vsubq_s8(vreinterpretq_s8_u8(zB.val[0]),b8q);
+        int8x16_t wB1=vsubq_s8(vreinterpretq_s8_u8(zB.val[1]),b8q);
+        int8x16_t xa0=vld1q_s8(x0+i), xa1=vld1q_s8(x0+i+16);
+        int8x16_t xb0=vld1q_s8(x1+i), xb1=vld1q_s8(x1+i+16);
+        acc=vmmlaq_s32(acc,vcombine_s8(vget_low_s8(xa0), vget_low_s8(xb0)),
+                           vcombine_s8(vget_low_s8(wA0), vget_low_s8(wB0)));
+        acc=vmmlaq_s32(acc,vcombine_s8(vget_high_s8(xa0),vget_high_s8(xb0)),
+                           vcombine_s8(vget_high_s8(wA0),vget_high_s8(wB0)));
+        acc=vmmlaq_s32(acc,vcombine_s8(vget_low_s8(xa1), vget_low_s8(xb1)),
+                           vcombine_s8(vget_low_s8(wA1), vget_low_s8(wB1)));
+        acc=vmmlaq_s32(acc,vcombine_s8(vget_high_s8(xa1),vget_high_s8(xb1)),
+                           vcombine_s8(vget_high_s8(wA1),vget_high_s8(wB1)));
+    }
+    vst1q_s32(out,acc);
+    for(;i<I;i++){
+        int wa=(int)((i&1)?(w40[i>>1]>>4):(w40[i>>1]&0xF))-8;
+        int wb=(int)((i&1)?(w41[i>>1]>>4):(w41[i>>1]&0xF))-8;
+        out[0]+=wa*x0[i]; out[1]+=wb*x0[i]; out[2]+=wa*x1[i]; out[3]+=wb*x1[i];
+    }
+}
+#endif /* __ARM_FEATURE_MATMUL_INT8 */
 static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int8_t *q,
                           const float *scale, int S, int I, int O){
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    if(S>=2 && g_i8mm){
+        #pragma omp parallel for schedule(static)
+        for(int op=0;op<O/2;op++){ int o=op*2;
+            const int8_t *w0=q+(int64_t)o*I, *w1=w0+I;
+            for(int s=0;s+2<=S;s+=2){
+                int32_t t[4]; dot2x2_i8i8(w0,w1,xq+(int64_t)s*I,xq+(int64_t)(s+1)*I,I,t);
+                y[(int64_t)s*O+o]      =(float)t[0]*scale[o]  *sx[s];
+                y[(int64_t)s*O+o+1]    =(float)t[1]*scale[o+1]*sx[s];
+                y[(int64_t)(s+1)*O+o]  =(float)t[2]*scale[o]  *sx[s+1];
+                y[(int64_t)(s+1)*O+o+1]=(float)t[3]*scale[o+1]*sx[s+1];
+            }
+            if(S&1){ int s=S-1;
+                y[(int64_t)s*O+o]  =(float)dot_i8i8(w0,xq+(int64_t)s*I,I)*scale[o]  *sx[s];
+                y[(int64_t)s*O+o+1]=(float)dot_i8i8(w1,xq+(int64_t)s*I,I)*scale[o+1]*sx[s]; }
+        }
+        if(O&1){ int o=O-1; const int8_t *w=q+(int64_t)o*I;
+            for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*scale[o]*sx[s]; }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const int8_t *w=q+(int64_t)o*I; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i8i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
@@ -676,6 +758,27 @@ static void matmul_q_idot(float *y, const int8_t *xq, const float *sx, const int
 static void matmul_i4_idot(float *y, const int8_t *xq, const float *sx, const uint8_t *q4,
                            const float *scale, int S, int I, int O){
     int rb=(I+1)/2;
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    if(S>=2 && g_i8mm){
+        #pragma omp parallel for schedule(static)
+        for(int op=0;op<O/2;op++){ int o=op*2;
+            const uint8_t *w0=q4+(int64_t)o*rb, *w1=w0+rb;
+            for(int s=0;s+2<=S;s+=2){
+                int32_t t[4]; dot2x2_i4i8(w0,w1,xq+(int64_t)s*I,xq+(int64_t)(s+1)*I,I,t);
+                y[(int64_t)s*O+o]      =(float)t[0]*scale[o]  *sx[s];
+                y[(int64_t)s*O+o+1]    =(float)t[1]*scale[o+1]*sx[s];
+                y[(int64_t)(s+1)*O+o]  =(float)t[2]*scale[o]  *sx[s+1];
+                y[(int64_t)(s+1)*O+o+1]=(float)t[3]*scale[o+1]*sx[s+1];
+            }
+            if(S&1){ int s=S-1;
+                y[(int64_t)s*O+o]  =(float)dot_i4i8(w0,xq+(int64_t)s*I,I)*scale[o]  *sx[s];
+                y[(int64_t)s*O+o+1]=(float)dot_i4i8(w1,xq+(int64_t)s*I,I)*scale[o+1]*sx[s]; }
+        }
+        if(O&1){ int o=O-1; const uint8_t *w=q4+(int64_t)o*rb;
+            for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*scale[o]*sx[s]; }
+        return;
+    }
+#endif
     #pragma omp parallel for schedule(static)
     for(int o=0;o<O;o++){ const uint8_t *w=q4+(int64_t)o*rb; float sc=scale[o];
         for(int s=0;s<S;s++) y[(int64_t)s*O+o]=(float)dot_i4i8(w,xq+(int64_t)s*I,I)*sc*sx[s]; }
@@ -3720,6 +3823,9 @@ int main(int argc, char **argv){
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+#if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
+    g_i8mm = getenv("I8MM")?atoi(getenv("I8MM")):1;        /* 0 = SMMLA tile off (A/B) */
+#endif
     g_repin = getenv("REPIN")?atoi(getenv("REPIN")):0;     /* RFC: re-pin ogni n token emessi (0=off) / live re-pin every n emitted tokens (0=off) */
     g_absorb = getenv("ABSORB")?atoi(getenv("ABSORB")):-1; /* -1 auto: assorbita per S<=4 */
     g_dsa_force = getenv("DSA_FORCE")?atoi(getenv("DSA_FORCE")):0;
