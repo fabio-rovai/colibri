@@ -122,17 +122,26 @@ def _rot_quant(x, bits, group):
     return (_quant_last_dim(x.float() @ q, bits, group) @ q.T).contiguous()
 
 
-SCHEME_RE = re.compile(r"^int(2|3|4|8)(?:-g(\d+))?(-rot)?(-nohead)?$")
+SCHEME_RE = re.compile(
+    r"^int(2|3|4|8)(?:-g(\d+))?(-rot)?(?:-gate(\d))?(?:-up(\d))?(?:-down(\d))?(-nohead)?$")
 
 
 def parse_scheme(name):
-    """'int4-g128-nohead' -> (bits=4, group=128, skip_head=True). 'fp16' -> None."""
+    """'int4-g128-nohead' -> (bits=4, group=128, rot, {}, skip_head=True). 'fp16' -> None.
+
+    Per-projection overrides (-gate<b>/-up<b>/-down<b>) quantize that EXPERT projection at a
+    different bit width, from the original weights (FloE-style mixed precision, arXiv
+    2505.05950: e.g. 'int4-g64-up2' asks whether up_proj tolerates 2 bits while gate/down
+    stay at 4)."""
     if name == "fp16":
         return None
     m = SCHEME_RE.match(name)
     if not m:
-        raise SystemExit(f"bad scheme '{name}' (expected fp16 | int{{2,3,4,8}}[-g<N>][-rot][-nohead])")
-    return int(m.group(1)), int(m.group(2) or 0), bool(m.group(3)), bool(m.group(4))
+        raise SystemExit(f"bad scheme '{name}' (expected fp16 | "
+                         f"int{{2,3,4,8}}[-g<N>][-rot][-gate<b>][-up<b>][-down<b>][-nohead])")
+    proj = {k: int(v) for k, v in
+            (("gate_proj", m.group(4)), ("up_proj", m.group(5)), ("down_proj", m.group(6))) if v}
+    return int(m.group(1)), int(m.group(2) or 0), bool(m.group(3)), proj, bool(m.group(7))
 
 
 def is_router(name):
@@ -152,7 +161,7 @@ def apply_scheme(model, scheme):
     spec = parse_scheme(scheme)
     if spec is None:
         return 0, 0, total
-    bits, group, rot, skip_head = spec
+    bits, group, rot, proj, skip_head = spec
     n = qp = 0
     with torch.no_grad():
         for name, p in model.named_parameters():
@@ -160,7 +169,13 @@ def apply_scheme(model, scheme):
                 continue
             if skip_head and is_head_or_embed(name):
                 continue
-            p.data.copy_(quantize_param(p.data.float(), bits, group, rot).to(p.dtype))
+            b = bits
+            if proj and "experts" in name:               # per-projection override
+                for k, v in proj.items():
+                    if k in name:
+                        b = v
+                        break
+            p.data.copy_(quantize_param(p.data.float(), b, group, rot).to(p.dtype))
             n += 1
             qp += p.numel()
     return n, qp, total

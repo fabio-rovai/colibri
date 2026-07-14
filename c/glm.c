@@ -182,7 +182,7 @@ typedef struct {
     uint64_t route_agree_hit, route_agree_tot;    /* ROUTE_AGREE: |chosen ∩ true top-K| / K */
     double route_kl_sum; uint64_t route_kl_n;     /* mean KL(true||chosen) on gate mass */
     double t_edisk, t_ewait, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo */
-    double t_aproj,t_acore,t_aout;                     /* attention breakdown */
+    double t_aproj,t_acore,t_aout,t_adsa;              /* attention breakdown */
     int64_t resident_bytes;
 } Model;
 
@@ -935,6 +935,32 @@ static _Atomic int g_cur_moe_layer=-1;   /* massimo layer moe in cui il MAIN e' 
 static _Atomic int g_pilot_inflight=-1;  /* layer che il worker sta REAL-caricando adesso (-1 = idle) */
 static _Atomic long g_pilot_loads=0;     /* load cross-layer VERI completati (banda spesa) */
 static _Atomic long g_pilot_drops=0;     /* predizioni scartate perche' il main possiede gia' il layer */
+
+/* ==== Measurement instrumentation (env-gated; zero effect when off) ====
+ * COLI_ACT_STATS=<path>: per-layer histogram of routed-expert silu(gate) magnitudes on
+ * decode (S==1) forwards, plus the |silu(g)*u| down-input mass carried by each magnitude
+ * bin. 48 log2 bins covering 2^-32..2^16; dump on exit as "layer bin count mass" lines.
+ * COLI_LOAD_STATS=1: split expert disk loads by cause (decode forward / batch forward /
+ * speculative) and count repeat-loads of the same (layer,expert) within one emitted token. */
+#define ACT_BINS 48
+static const char *g_act_path=NULL;
+static uint64_t *g_act_cnt=NULL; static double *g_act_mass=NULL; static int g_act_nl=0;
+static void act_dump(void){
+    if(!g_act_path||!g_act_cnt) return;
+    FILE *f=fopen(g_act_path,"w"); if(!f) return;
+    for(int l=0;l<g_act_nl;l++) for(int b=0;b<ACT_BINS;b++){
+        uint64_t cn=g_act_cnt[(int64_t)l*ACT_BINS+b];
+        if(cn) fprintf(f,"%d %d %llu %.6e\n",l,b,(unsigned long long)cn,
+                       g_act_mass[(int64_t)l*ACT_BINS+b]);
+    }
+    fclose(f);
+}
+static int g_load_stats=0;
+static _Atomic uint64_t g_ld_total=0,g_ld_spec=0,g_ld_repeat=0,g_ld_s1=0,g_ld_batch=0;
+static _Atomic uint32_t g_emit_epoch=0;
+static _Atomic uint32_t *g_ld_epoch=NULL;   /* [NR*E]: epoch+1 of last load of (layer,eid) */
+static int g_ld_E=0;
+static _Atomic int g_moe_S=1;               /* S of the moe() forward in flight */
 /* sceglie il formato da `bits`: >=16 f32, 5..8 int8, <=4 int4-packed */
 static void qt_alloc(QT *t, int O, int I, int bits){
     t->O=O; t->I=I; t->qf=NULL; t->q8=NULL; t->q4=NULL; t->s=NULL;
@@ -1133,6 +1159,8 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
     m->pin=calloc(NR,sizeof(ESlot*)); m->npin=calloc(NR,sizeof(int));
     m->eusage=calloc(NR,sizeof(uint32_t*)); m->eheat=calloc(NR,sizeof(uint32_t*));
     m->elast=calloc(NR,sizeof(uint32_t*));
+    if(g_load_stats && !g_ld_epoch){ g_ld_E=c->n_experts;
+        g_ld_epoch=calloc((int64_t)NR*g_ld_E,sizeof(uint32_t)); }
     m->kv=calloc(1,sizeof(KVState));
     m->kv_start=m->kv->kv_start=calloc(NR,sizeof(int));
     for(int i=0;i<c->n_layers;i++){
@@ -1332,6 +1360,17 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
     if(s->eid!=eid){ qt_cuda_reset(&s->g); qt_cuda_reset(&s->u); qt_cuda_reset(&s->d); }
 #endif
     Cfg *c=&m->c; int I=c->moe_inter, D=c->hidden, b=m->ebits;
+    if(g_load_stats && g_ld_epoch && layer>=0 && eid>=0 && eid<g_ld_E){
+        atomic_fetch_add_explicit(&g_ld_total,1,memory_order_relaxed);
+        if(!fatal) atomic_fetch_add_explicit(&g_ld_spec,1,memory_order_relaxed);
+        else if(atomic_load_explicit(&g_moe_S,memory_order_relaxed)>1)
+            atomic_fetch_add_explicit(&g_ld_batch,1,memory_order_relaxed);
+        else atomic_fetch_add_explicit(&g_ld_s1,1,memory_order_relaxed);
+        uint32_t ep=atomic_load_explicit(&g_emit_epoch,memory_order_relaxed)+1;
+        uint32_t old=atomic_exchange_explicit(&g_ld_epoch[(int64_t)layer*g_ld_E+eid],ep,
+                                              memory_order_relaxed);
+        if(old==ep) atomic_fetch_add_explicit(&g_ld_repeat,1,memory_order_relaxed);
+    }
     char nm[3][288]; const char *suf[3]={"gate_proj","up_proj","down_proj"};
     for(int k=0;k<3;k++) snprintf(nm[k],sizeof(nm[k]),"model.layers.%d.mlp.experts.%d.%s.weight",layer,eid,suf[k]);
     char qn[300]; snprintf(qn,sizeof(qn),"%s.qs",nm[0]);
@@ -1871,6 +1910,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
      * dai layer SHARED successivi). Selezione attiva solo con contesto > index_topk
      * (o DSA_FORCE=1 per il test: selezionare TUTTO deve dare l'output denso esatto). */
     const int *dsel=NULL, *dnsel=NULL; int dtopk=0;
+    double tdsa0=now_s();
     if(m->has_dsa && layer<c->n_layers && ((!kvs && m->kv_start[layer]==0) || kvs)){
         int nh=c->index_nh, hd=c->index_hd; dtopk=c->index_topk;
         if(c->idx_type[layer]){
@@ -1933,6 +1973,7 @@ static void attention_rows(Model *m, Layer *l, int layer, float *x, int S, int p
         }
         if(m->dsa_nsel){ dsel=m->dsa_sel; dnsel=m->dsa_nsel; }
     }
+    m->t_adsa+=now_s()-tdsa0;
     /* WEIGHT ABSORPTION (DeepSeek): per S piccoli (decode/verifica MTP) NON si ricostruisce
      * k/v per ogni token del contesto. Per linearita':
      *   q·k_nope_t = (W_K^hT q_nope)·L_t      ctx^h = W_V^h (Σ_t a_t L_t)
@@ -2106,6 +2147,7 @@ static int expert_is_resident(Model *m, int layer, int eid){
 }
 
 static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int with_shared){
+    if(g_load_stats) atomic_store_explicit(&g_moe_S,S,memory_order_relaxed);
     if(g_pilot_real){   /* barriera cross-layer: prendi possesso di QUESTO layer e aspetta
                          * l'eventuale load-pilota in volo sullo stesso layer (dopodiche' il
                          * worker droppa ogni nuovo load <= layer -> ecache[layer] e' stabile
@@ -2485,6 +2527,21 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out, int 
             if(!e->slab) expert_host_ensure(m,layer,e);
 #endif
             expert_gate_up(gg,uu,xg,&e->g,&e->u,nr);
+            if(g_act_path && S==1){                    /* M1: decode-token activation stats */
+                if(!g_act_cnt){ g_act_nl=c->n_layers;
+                    g_act_cnt=calloc((int64_t)g_act_nl*ACT_BINS,sizeof(uint64_t));
+                    g_act_mass=calloc((int64_t)g_act_nl*ACT_BINS,sizeof(double));
+                    atexit(act_dump); }
+                uint64_t *cn=g_act_cnt+(int64_t)layer*ACT_BINS;
+                double *ms=g_act_mass+(int64_t)layer*ACT_BINS;
+                for(int64_t z=0;z<(int64_t)nr*I;z++){
+                    float sv=siluf(gg[z]); float av=fabsf(sv); int bb=0;
+                    if(av>0){ bb=(int)floorf(log2f(av))+32;
+                        if(bb<0)bb=0; if(bb>=ACT_BINS)bb=ACT_BINS-1; }
+                    cn[bb]++; ms[bb]+=fabs((double)sv*(double)uu[z]);
+                    gg[z]=sv*uu[z];
+                }
+            } else
             for(int64_t z=0;z<(int64_t)nr*I;z++) gg[z]=siluf(gg[z])*uu[z];
             matmul_qt(hh, gg, &e->d, nr);
             for(int r=0;r<nr;r++){ float *os=out+(int64_t)rows[r]*D, wgt=rw[r], *hr=hh+(int64_t)r*D;
@@ -3405,6 +3462,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
+        atomic_fetch_add_explicit(&g_emit_epoch,1,memory_order_relaxed);
         gr_feed(next);                                  /* il walker segue l'output emesso */
         if(emitted>=n_new) break;                       /* l'ultimo token non serve forwardarlo */
         int g = 0, gsrc = 0;                            /* sorgente: 1=grammatica 2=MTP/n-gram */
@@ -3442,6 +3500,7 @@ static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *lo
             if(!accept){ if(g_temp>0) carry_ban=draft[k]; break; }
             if((eos>=0 && draft[k]==eos) || is_stop(draft[k])){ done=1; break; }
             emit(draft[k],ud); all[kv+1+k]=draft[k]; emitted++; m->n_emit++;
+            atomic_fetch_add_explicit(&g_emit_epoch,1,memory_order_relaxed);
             gr_feed(draft[k]); k++;
         }
         if(gsrc==1) g_gr_acc+=(uint64_t)k;
@@ -3551,8 +3610,21 @@ static void profile_print(Model *m, double elapsed){
     printf("PROFILE: expert-disk %.3fs service / %.3fs wait | expert-matmul %.3fs | attention %.3fs "
            "(including kvb %.3fs) | lm_head %.3fs | other %.3fs\n",
         m->t_edisk,m->t_ewait,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
-    printf("ATTENTION: projection/RoPE %.3fs | score-softmax-value %.3fs | output projection %.3fs\n",
-        m->t_aproj,m->t_acore,m->t_aout);
+    printf("ATTENTION: projection/RoPE %.3fs (of which dsa-indexer %.3fs) | score-softmax-value %.3fs | output projection %.3fs\n",
+        m->t_aproj,m->t_adsa,m->t_acore,m->t_aout);
+    if(g_load_stats){
+        uint64_t lt=atomic_load_explicit(&g_ld_total,memory_order_relaxed);
+        uint64_t ls=atomic_load_explicit(&g_ld_s1,memory_order_relaxed);
+        uint64_t lb=atomic_load_explicit(&g_ld_batch,memory_order_relaxed);
+        uint64_t lp=atomic_load_explicit(&g_ld_spec,memory_order_relaxed);
+        uint64_t lr=atomic_load_explicit(&g_ld_repeat,memory_order_relaxed);
+        printf("LOADSPLIT: total %llu | decode-fw %llu | batch-fw %llu | speculative %llu | "
+               "repeat-within-token %llu | emitted %llu -> %.1f loads/token (requested %llu -> %.1f/token)\n",
+            (unsigned long long)lt,(unsigned long long)ls,(unsigned long long)lb,
+            (unsigned long long)lp,(unsigned long long)lr,(unsigned long long)m->n_emit,
+            m->n_emit?(double)lt/m->n_emit:0.0,
+            (unsigned long long)m->ereq, m->n_emit?(double)m->ereq/m->n_emit:0.0);
+    }
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);
@@ -3566,7 +3638,12 @@ static void profile_print(Model *m, double elapsed){
 
 static void profile_reset(Model *m){
     m->t_edisk=m->t_ewait=m->t_emm=m->t_attn=m->t_kvb=m->t_head=0;
-    m->t_aproj=m->t_acore=m->t_aout=0;
+    m->t_aproj=m->t_acore=m->t_aout=m->t_adsa=0;
+    atomic_store_explicit(&g_ld_total,0,memory_order_relaxed);
+    atomic_store_explicit(&g_ld_s1,0,memory_order_relaxed);
+    atomic_store_explicit(&g_ld_batch,0,memory_order_relaxed);
+    atomic_store_explicit(&g_ld_spec,0,memory_order_relaxed);
+    atomic_store_explicit(&g_ld_repeat,0,memory_order_relaxed);
 }
 
 /* Fixed-token decode benchmark: prefill all but the prompt's last token, then
@@ -4003,6 +4080,7 @@ static int mux_submit(Model *m, Tok *T, ServeCtx *ctx, ServeReq *req, int nctx,
     int next=pick_tok(logit,m->c.vocab,-1); free(logit);
     if(r->maximum<=0 || next==eos || is_stop(next)){ mux_done(m,sc,r); return 1; }
     r->pending=next; r->emitted=1; r->active=1; sc->hist[sc->len]=next; m->n_emit++;
+    atomic_fetch_add_explicit(&g_emit_epoch,1,memory_order_relaxed);
     mux_data(T,r->id,next);
     if(r->emitted>=r->maximum) mux_done(m,sc,r);
     return 1;
@@ -4763,6 +4841,8 @@ int main(int argc, char **argv){
     if(g_mmap) fprintf(stderr,"[MMAP] expert = viste zero-copy nei file (page cache = cache)\n");
     g_topk = getenv("TOPK")?atoi(getenv("TOPK")):0;
     g_topp = getenv("TOPP")?atof(getenv("TOPP")):0;
+    g_act_path = getenv("COLI_ACT_STATS");
+    g_load_stats = getenv("COLI_LOAD_STATS")?atoi(getenv("COLI_LOAD_STATS")):0;
     g_cache_route = getenv("CACHE_ROUTE")?atoi(getenv("CACHE_ROUTE")):0;
     g_route_j = getenv("ROUTE_J")?atoi(getenv("ROUTE_J")):2;
     g_route_m = getenv("ROUTE_M")?atoi(getenv("ROUTE_M")):12;

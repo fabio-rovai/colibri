@@ -214,11 +214,25 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->dense_load_s = now_s() - t0;
 }
 
+/* Per-projection quantization override (measurement: FloE-style mixed precision).
+ * GATE_BITS/UP_BITS/DOWN_BITS=n (2..8) quantize that projection at n bits while the
+ * others stay at the CLI-level bits. Only affects the runtime-quantized path (raw
+ * bf16/f32 checkpoints); pre-quantized int8 containers are read as-is. */
+static int proj_bits(int which, int dflt) {      /* which: 0=gate 1=up 2=down */
+    static int pb[3] = {-2,-2,-2};
+    if (pb[which] == -2) {
+        const char *nm[3] = {"GATE_BITS","UP_BITS","DOWN_BITS"};
+        const char *e = getenv(nm[which]);
+        pb[which] = (e && atoi(e) >= 2 && atoi(e) <= 8) ? atoi(e) : -1;
+    }
+    return pb[which] < 0 ? dflt : pb[which];
+}
+
 /* legge un weight dal disco (streaming) e lo quantizza in q[O,I]+scale[O].
  * Container pre-quantizzato (convert_olmoe.py: int8 + scale f32 in "name.qs"):
  * lettura raw diretta — meta' I/O e zero quantize_rows a runtime. Prima di
  * questa patch il container int8 causava SIGBUS (st_read_f32 su tensori I8). */
-static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, int O, int I, float *tmp) {
+static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, int O, int I, float *tmp, int bits) {
     st_tensor *t = st_find(&m->S, name);
     if (t && t->dtype == 3) {                    /* I8/U8: container colibri */
         char qs[300]; snprintf(qs, sizeof(qs), "%s.qs", name);
@@ -227,7 +241,7 @@ static void load_expert_w(Model *m, const char *name, int8_t *q, float *scale, i
         return;
     }
     st_read_f32(&m->S, name, tmp, 1);            /* pread + fadvise DONTNEED */
-    quantize_rows(tmp, q, scale, O, I, m->quant_bits);
+    quantize_rows(tmp, q, scale, O, I, bits);
 }
 
 /* ---------- cache expert: ritorna i pesi quantizzati (q+scale) da cache o disco ---------- */
@@ -247,9 +261,9 @@ static void expert_get(Model *m, int layer, int eid, Slot **out) {
     } else { int lru = 0; for (int i = 1; i < lc->n; i++) if (lc->slots[i].used < lc->slots[lru].used) lru = i; s = &lc->slots[lru]; }
     float *tmp = falloc(ng > nd ? ng : nd);
     char nm[256];
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",layer,eid); load_expert_w(m,nm,s->g,s->gs,c->inter,c->hidden,tmp);
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.up_proj.weight",  layer,eid); load_expert_w(m,nm,s->u,s->us,c->inter,c->hidden,tmp);
-    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.down_proj.weight",layer,eid); load_expert_w(m,nm,s->d,s->ds,c->hidden,c->inter,tmp);
+    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.gate_proj.weight",layer,eid); load_expert_w(m,nm,s->g,s->gs,c->inter,c->hidden,tmp,proj_bits(0,m->quant_bits));
+    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.up_proj.weight",  layer,eid); load_expert_w(m,nm,s->u,s->us,c->inter,c->hidden,tmp,proj_bits(1,m->quant_bits));
+    snprintf(nm,sizeof(nm),"model.layers.%d.mlp.experts.%d.down_proj.weight",layer,eid); load_expert_w(m,nm,s->d,s->ds,c->hidden,c->inter,tmp,proj_bits(2,m->quant_bits));
     free(tmp);
     s->eid = eid; s->used = ++m->clock;
     *out = s;
@@ -377,6 +391,26 @@ static float *step(Model *m, const int *ids, int S, int pos_base) {
     return logit;
 }
 
+/* come step(), ma parte sempre da pos 0 e ritorna x[S,D] dopo tutti i layer
+ * (pre-final-norm): serve al run_score per i logits di OGNI posizione. */
+static float *step_x(Model *m, const int *ids, int S) {
+    Cfg *c = &m->c; int D = c->hidden;
+    float *x = falloc((int64_t)S*D);
+    for (int s = 0; s < S; s++) memcpy(x + (int64_t)s*D, m->embed + (int64_t)ids[s]*D, D*sizeof(float));
+    float *nrm = falloc((int64_t)S*D), *tmp = falloc((int64_t)S*D);
+    for (int i = 0; i < c->n_layers; i++) {
+        Layer *l = &m->L[i];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->in_ln, D, c->eps);
+        attention(m, l, i, nrm, S, 0, tmp);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+        for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s*D, x + (int64_t)s*D, l->post_ln, D, c->eps);
+        moe(m, l, i, nrm, S, tmp);
+        for (int64_t j = 0; j < (int64_t)S*D; j++) x[j] += tmp[j];
+    }
+    free(nrm); free(tmp);
+    return x;
+}
+
 /* generazione greedy. prompt[np] -> riempie out[np+n_new] */
 static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     Cfg *c = &m->c;
@@ -400,6 +434,54 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+/* SCORE=<requests.txt>: log-likelihood scoring, same line protocol as glm.c run_score
+ * (and tools/eval_glm.py). Each line: "ctxlen contlen id id id ...". Output per line:
+ * "logprob contlen greedy". Runs the full sequence as one prefill; K/V sized to the
+ * longest request in the file. */
+static float *step_x(Model *m, const int *ids, int S);   /* forward, returns x[S,D] post-layers */
+
+static double logprob_target(const float *lo, int V, int target, int *argmax_hit) {
+    float mx = lo[0]; int am = 0;
+    for (int i = 1; i < V; i++) if (lo[i] > mx) { mx = lo[i]; am = i; }
+    double se = 0; for (int i = 0; i < V; i++) se += exp((double)lo[i] - mx);
+    *argmax_hit = (am == target);
+    return (double)lo[target] - mx - log(se);
+}
+
+static void run_score(Model *m, const char *path) {
+    Cfg *c = &m->c; int D = c->hidden;
+    FILE *f = fopen(path, "rb"); if(!f){perror(path);exit(1);}
+    int maxT = 1; { char *ln=NULL; size_t cp=0;
+        while (getline(&ln,&cp,f) > 0) { int a,b; if (sscanf(ln,"%d %d",&a,&b)==2 && a+b>maxT) maxT=a+b; }
+        free(ln); }
+    m->max_t = maxT;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)c->n_heads * maxT * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_heads * maxT * c->head_dim);
+    }
+    float *lo = falloc(c->vocab), *row = falloc(D);
+    int *ids = malloc(maxT * sizeof(int));
+    rewind(f); char *ln=NULL; size_t cp=0; int nreq=0; double t0=now_s();
+    while (getline(&ln,&cp,f) > 0) {
+        char *p = ln; int ctxlen = strtol(p,&p,10), contlen = strtol(p,&p,10), T = ctxlen+contlen;
+        if (T <= 0 || ctxlen < 1 || T > maxT) { printf("0 0 0\n"); fflush(stdout); continue; }
+        for (int i = 0; i < T; i++) ids[i] = strtol(p,&p,10);
+        float *x = step_x(m, ids, T);
+        double lp = 0; int greedy = 1;
+        for (int pos = ctxlen-1; pos < T-1; pos++) {
+            rmsnorm_row(row, x + (int64_t)pos*D, m->final_norm, D, c->eps);
+            matmul(lo, row, m->lm_head, 1, D, c->vocab);
+            int am; lp += logprob_target(lo, c->vocab, ids[pos+1], &am); if (!am) greedy = 0;
+        }
+        free(x);
+        printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
+        if (++nreq % 20 == 0) fprintf(stderr, "[score %d req | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
+            nreq, now_s()-t0, rss_gb(), (m->hits+m->miss)?100.0*m->hits/(m->hits+m->miss):0.0);
+    }
+    free(ln); free(ids); free(lo); free(row); fclose(f);
+}
+
 /* ---------- lettura ref.json ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -418,6 +500,16 @@ int main(int argc, char **argv) {
         return 1;
     }
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
+
+    if (getenv("SCORE")) {                       /* benchmark scoring mode (eval_glm.py) */
+        Model m; model_init(&m, snap, cap, bits);
+        fprintf(stderr, "== OLMoE scoring, cache = %d experts/layer, experts @ %d-bit "
+                "(gate %d / up %d / down %d) ==\n", cap, bits,
+                proj_bits(0,bits), proj_bits(1,bits), proj_bits(2,bits));
+        fprintf(stderr, "resident weights loaded in %.1fs | RSS %.2f GB\n", m.dense_load_s, rss_gb());
+        run_score(&m, getenv("SCORE"));
+        return 0;
+    }
 
     FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
