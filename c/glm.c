@@ -799,6 +799,12 @@ static float g_temp=-1;  /* TEMP: temperatura di sampling sui TOKEN. <0 = auto (
                           * 0=greedy in validazione). 0 = greedy puro. */
 static float g_nuc=0.95f;/* NUCLEUS: top-p sul vocabolario (default dal generation_config GLM-5.2) */
 static int g_topk=0;     /* TOPK=n -> usa n expert/token invece di config (ricerca: meno disco) */
+static int g_eparity=-1; /* EXPERT_PARITY=0|1 (FANGS, private bench): route only within the
+                          * even|odd expert half. Combined with TOPK=4 this yields one "fang" —
+                          * a degraded-but-in-distribution half-view of the model (all experts
+                          * still exist; each token routes within a half; norm_topk renormalizes
+                          * the gates). Two fangs + agreement gating + full-model arbitration =
+                          * Fréchet Adversary Neural Generative System (measurement phase). */
 static float g_topp=0;   /* TOPP=p (0..1) -> top-p adattivo: tieni gli expert fino a peso cumulato p */
 static int g_spec=1;     /* metodo C: SPEC=0 disabilita il prefetch speculativo cross-layer */
 static int g_draft=0;    /* metodo E: DRAFT=n token auto-speculati per forward via n-gram lookup
@@ -819,6 +825,8 @@ static int g_gr_on=0;     /* grammatica caricata e walker vivo */
 static int g_gr_armed=0;  /* lazy: parte dal primo byte ammesso dalla radice (salta i preamboli) */
 static int g_gr_max=24;
 static uint64_t g_gr_prop=0, g_gr_acc=0;
+static FILE *g_score_fp=NULL; /* SCORE_DUMP=<path>: per-position (pos, logprob, argmax-match) rows
+                               * from SCORE mode — offline coupling/reconstruction analysis. */
 static FILE *g_route_fp=NULL; /* ROUTE_TRACE=<path>: dump per-position top-K routing (ids:gates)
                                * per layer — offline co-activation / coupling analysis. Zero
                                * effect on computation; measurement only. */
@@ -1800,6 +1808,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
         const float *xs=x+(int64_t)s*D;
         matmul(logit, xs, l->router, 1, D, E);
         for(int e=0;e<E;e++){ logit[e]=sigmoidf(logit[e]); choice[e]=logit[e]+l->router_bias[e]; }
+        if(g_eparity>=0) for(int e=0;e<E;e++) if((e&1)!=g_eparity) choice[e]=-1e30f;
         int *idx=idxs+(int64_t)s*K; float *w=ws+(int64_t)s*K;
         int Ksel = g_topk>0 ? (g_topk<K?g_topk:K) : K;
         for(int kk=0;kk<Ksel;kk++){ int best=-1; float bv=-1e30f;
@@ -2844,7 +2853,8 @@ static void run_score(Model *m, const char *path){
         for(int pos=ctxlen-1; pos<T-1; pos++){
             rmsnorm(row, x+(int64_t)pos*D, m->final_norm, D, c->eps);
             matmul_qt(lo,row,&m->lm_head,1);
-            int am; lp += logprob_target(lo,c->vocab,ids[pos+1],&am); if(!am) greedy=0;
+            int am; double lp1=logprob_target(lo,c->vocab,ids[pos+1],&am); lp+=lp1; if(!am) greedy=0;
+            if(g_score_fp) fprintf(g_score_fp,"%d %.6f %d\n",pos,lp1,am);
         }
         printf("%.6f %d %d\n", lp, contlen, greedy); fflush(stdout);
         if(++nreq%5==0) fprintf(stderr,"[score %d req | %.1fs | RSS %.2f GB | hit %.0f%%]\n",
@@ -3820,6 +3830,8 @@ int main(int argc, char **argv){
     if(g_pipe_nw<1) g_pipe_nw=1;
     g_direct = getenv("DIRECT")?atoi(getenv("DIRECT")):0;
     g_idot = getenv("IDOT")?atoi(getenv("IDOT")):1;        /* 0 = kernel f32 esatti (A/B) */
+    if(getenv("EXPERT_PARITY")) g_eparity=atoi(getenv("EXPERT_PARITY"))&1;
+    if(getenv("SCORE_DUMP")&&*getenv("SCORE_DUMP")) g_score_fp=fopen(getenv("SCORE_DUMP"),"w");
     if(getenv("ROUTE_TRACE")&&*getenv("ROUTE_TRACE")){
         g_route_fp=fopen(getenv("ROUTE_TRACE"),"w");
         if(!g_route_fp) fprintf(stderr,"[ROUTE_TRACE] cannot open %s\n",getenv("ROUTE_TRACE"));
