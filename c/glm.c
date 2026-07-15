@@ -96,6 +96,8 @@ typedef struct {
 /* fmt: 0 F32, 1 INT8, 2 INT4 (2/byte), 3 INT2 (4/byte). q4 ospita sia int4 che int2 packed. */
 typedef struct {
     int fmt; float *qf; int8_t *q8; uint8_t *q4; float *s; int O, I;
+    int gs;   /* scale group size along I: 0/I = one scale per row (legacy); <I = grouped
+               * (name.qs holds O*(I/gs) scales, row-major). Only embed_row honours it. */
 #ifdef COLI_CUDA
     ColiCudaTensor *cuda;
 #endif
@@ -1061,8 +1063,13 @@ static void qt_from_disk(Model *m, const char *name, int O, int I, int bits, int
     if(st_has(&m->S,sn)){
         int64_t nb=st_nbytes(&m->S,name);
         int fmt = (nb==(int64_t)O*I)?1 : (nb==(int64_t)O*((I+1)/2))?2 : 3;  /* int8 / int4 / int2 dai byte */
-        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q8,drop); }
-        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=qalloc(nb); t->s=qsalloc(O); } st_read_raw(&m->S,name,t->q4,drop); }
+        /* scale grouping: name.qs has O scales (per-row) or O*(I/gs) scales (grouped).
+         * gs=I means one group = whole row = per-row (the legacy case, computed uniformly). */
+        int64_t qn=st_numel(&m->S,sn); if(qn<O) qn=O;
+        int ng=(int)(qn/O); if(ng<1) ng=1; int gs=(ng>1)?(I/ng):I;
+        if(fmt==1){ if(t->fmt!=1||!t->q8){ t->fmt=1; t->O=O; t->I=I; t->q8=qalloc(nb); t->s=qsalloc((int)qn); } st_read_raw(&m->S,name,t->q8,drop); }
+        else      { if(t->fmt!=fmt||!t->q4){ t->fmt=fmt; t->O=O; t->I=I; t->q4=qalloc(nb); t->s=qsalloc((int)qn); } st_read_raw(&m->S,name,t->q4,drop); }
+        t->gs=gs;
         st_read_f32(&m->S,sn,t->s,drop);
     } else {
         if(!t->qf && !t->q8 && !t->q4) qt_alloc(t,O,I,bits);
@@ -1277,14 +1284,20 @@ static void model_init(Model *m, const char *snap, int cap, int ebits, int dbits
 static void embed_row(Model *m, int tok, float *x){
     int D=m->c.hidden; QT *e=&m->embed;
     if(e->fmt==0){ memcpy(x, e->qf+(int64_t)tok*D, D*sizeof(float)); return; }
-    if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D; float s=e->s[tok];
-        for(int i=0;i<D;i++) x[i]=(float)q[i]*s; return; }
-    if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2); float s=e->s[tok];   /* int4 */
-        for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*s;
-            if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*s; }
+    /* grouped scales: gsz elements share one scale; gsz>=D (or 0) = one scale per row.
+     * SC(i) picks the group scale for element i of this token's row. */
+    int gsz=(e->gs>0 && e->gs<D)?e->gs:D, ng=D/gsz;
+    const float *sr=e->s+(int64_t)tok*ng;
+    #define SC(i) sr[(i)/gsz]
+    if(e->fmt==1){ const int8_t *q=e->q8+(int64_t)tok*D;
+        for(int i=0;i<D;i++) x[i]=(float)q[i]*SC(i); return; }
+    if(e->fmt==2){ const uint8_t *q=e->q4+(int64_t)tok*((D+1)/2);   /* int4 */
+        for(int i=0;i<D;i+=2){ uint8_t byte=q[i>>1]; x[i]=(float)((int)(byte&0xF)-8)*SC(i);
+            if(i+1<D) x[i+1]=(float)((int)(byte>>4)-8)*SC(i+1); }
         return; }
-    const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4); float s=e->s[tok];   /* int2 */
-    for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*s; }
+    const uint8_t *q=e->q4+(int64_t)tok*((D+3)/4);   /* int2 */
+    for(int i=0;i<D;i++){ uint8_t byte=q[i>>2]; int sh=(i&3)*2; x[i]=(float)((int)((byte>>sh)&3)-2)*SC(i); }
+    #undef SC
 }
 
 /* COLI_MMAP=1: gli expert diventano VISTE dentro mmap dei file safetensors (niente pread,
