@@ -150,6 +150,9 @@ typedef struct {
     uint64_t gpu_expert_calls; int gpu_expert_count; int64_t gpu_expert_bytes;
     uint64_t n_fw, n_emit;                       /* metodo E: forward di decode / token emessi */
     double t_edisk, t_emm, t_attn, t_kvb, t_head;/* profiling: dove va il tempo (sempre attivo) */
+    /* ALTRO: le fette finora NON misurate (25% del wall). t_route = readback routing +
+     * resolve cache/LRU; t_glue = prologo/epilogo layer, alloc, copie, residui. */
+    double t_route, t_glue, t_moe, t_layers;
     int64_t resident_bytes;
 } Model;
 
@@ -1132,6 +1135,41 @@ static void attention(Model *m, Layer *l, int layer, float *x, int S, int pos_ba
 #ifdef COLI_METAL
     /* Fused decode attention on GPU: whole layer in one command buffer (keeps the GPU hot).
      * S<=4 absorption path with st0==0, DSA selection inactive, and GLM-5.2 int4 dims. */
+    /* PREFILL SU GPU (chunked): i kernel Metal sono gia' generici in S — la mask causale
+     * usa (PB+s) e la KV write-back e' per-posizione — quindi il prefill si puo' spezzare
+     * in chunk da COLI_METAL_PFC posizioni e passare dalla stessa strada dell'absorption.
+     * Prima: S>4 -> tutta l'attenzione del prompt su CPU (~4.1 TFLOP a ~67 GFLOP/s).
+     * Il limite vero era solo AMAXS (scratch), non i kernel. */
+    int metal_shape_ok = g_metal_enabled && m->kv_start[layer]==0
+       && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
+       && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2;
+    int pfc = getenv("COLI_METAL_PFC") ? atoi(getenv("COLI_METAL_PFC")) : 32;
+    if(pfc>32) pfc=32; if(pfc<1) pfc=1;
+    if(metal_shape_ok && S>4 && pfc>1 && !(m->has_dsa && layer<c->n_layers && c->idx_type[layer]
+                                           && (pos_base+S) > c->index_topk)){
+        int done_all=1;
+        for(int off=0; off<S; off+=pfc){
+            int cs = S-off < pfc ? S-off : pfc;
+            if(m->has_dsa && layer<c->n_layers && c->idx_type[layer]){
+                for(int s=0;s<cs;s++){ int pos=pos_base+off+s; float *kd=m->Ic[layer]+(int64_t)pos*c->index_hd;
+                    matmul_qt(kd, x+(int64_t)(off+s)*D, &m->ix_wk[layer], 1);
+                    layernorm(kd, m->ix_knw[layer], m->ix_knb[layer], c->index_hd, 1e-6f);
+                    rope_interleave(kd, pos, c); }
+            }
+            #define WPP_(q) ((q).fmt==1?(const void*)(q).q8:(const void*)(q).q4)
+            int ok = coli_metal_attn_decode(x+(int64_t)off*D,
+                WPP_(l->q_a), l->q_a.s, l->q_a.fmt, l->q_a_ln,
+                WPP_(l->q_b), l->q_b.s, l->q_b.fmt,
+                WPP_(l->kv_a), l->kv_a.s, l->kv_a.fmt, l->kv_a_ln,
+                WPP_(l->kv_b), l->kv_b.s, l->kv_b.fmt,
+                WPP_(l->o), l->o.s, l->o.fmt,
+                m->Lc[layer], m->Rc[layer], cs, pos_base+off, m->kv_start[layer],
+                c->eps, c->theta, c->attn_scale, out+(int64_t)off*D);
+            #undef WPP_
+            if(!ok){ done_all=0; break; }        /* fallback: rifai tutto su CPU */
+        }
+        if(done_all){ m->t_attn += now_s()-ta0; return; }
+    }
     if(g_metal_enabled && S<=4 && (g_absorb==1||(g_absorb<0&&S<=4)) && m->kv_start[layer]==0
        && D==6144 && H==64 && c->q_lora==2048 && c->kv_lora==512 && c->qk_nope==192
        && c->qk_rope==64 && vh==256 && l->kv_b.fmt==2){
@@ -1386,6 +1424,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
     for(int base=0;base<nu;base+=64){
         int nb = nu-base<64 ? nu-base : 64;
         ESlot *use[64]; int missk[64]; int nmiss=0;
+        double tr0=now_s();
         for(int j=0;j<nb;j++){ int eid=uniq[base+j]; use[j]=NULL;
             ESlot *P=m->pin[layer];
             for(int z=0;z<m->npin[layer];z++) if(P[z].eid==eid){ m->hits++; use[j]=&P[z]; break; }
@@ -1393,6 +1432,7 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 for(int z=0;z<nn;z++) if(Sl[z].eid==eid){ m->hits++; Sl[z].used=++m->eclock; use[j]=&Sl[z]; break; } }
             if(!use[j]){ use[j]=&m->ws[nmiss]; missk[nmiss++]=j; m->miss++; }
         }
+        m->t_route += now_s()-tr0;
         int metal_done=0;
 #ifdef COLI_METAL
         /* GPU/disk OVERLAP: submit the RESIDENT experts (pin/LRU hits, + shared expert on
@@ -1506,12 +1546,13 @@ static void moe(Model *m, Layer *l, int layer, float *x, int S, float *out){
                 for(int d=0;d<D;d++) os[d]+=wgt*hr[d]; }
             m->t_emm += now_s()-t0;
         }
-        { ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
+        { double tg0=now_s(); ESlot *Sl=m->ecache[layer]; int *nn=&m->ecn[layer];   /* promozione LRU (swap buffer) */
           int promo = nmiss<m->ecap ? nmiss : m->ecap;
           for(int a=0;a<promo;a++){ int q=nmiss-1-a; ESlot *dst;
               if(*nn<m->ecap) dst=&Sl[(*nn)++];
               else { int lru=0; for(int z=1;z<*nn;z++) if(Sl[z].used<Sl[lru].used) lru=z; dst=&Sl[lru]; }
               ESlot tmp=*dst; *dst=m->ws[q]; m->ws[q]=tmp; dst->used=++m->eclock; }
+          m->t_glue += now_s()-tg0;
         }
     }
     /* ---- FASE E: shared expert, un matmul a S righe (skipped se fuso nel blocco GPU) ---- */
@@ -1663,7 +1704,9 @@ static void layer_forward(Model *m, Layer *l, int li, float *x, int S, int pos_b
                 if(g_pilot && S<=8 && li+1<c->n_layers && m->L[li+1].sparse) pilot_prefetch(m,li+1,x,S);
                 if(g_looka && S==1 && li+1<c->n_layers && m->L[li+1].sparse) la_predict(m,li+1,x,1);
                 g_pre_idx=lidx; g_pre_w=lw; g_pre_keff=lkeff; g_pre_sh=lsh;
+                double tm0=now_s();
                 moe(m,l,li,lnrm,S,tmp);
+                m->t_moe += now_s()-tm0;
                 g_pre_idx=NULL; g_pre_w=NULL; g_pre_keff=NULL; g_pre_sh=NULL;
                 for(int64_t j=0;j<(int64_t)S*D;j++) x[j]+=tmp[j];
                 return;
@@ -1737,7 +1780,7 @@ static float *step(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-    layers_forward(m,x,S,pos_base);
+    { double tl0=now_s(); layers_forward(m,x,S,pos_base); m->t_layers += now_s()-tl0; }
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     if(m->has_mtp && S>=2 && g_draft>0) mtp_absorb(m, ids+1, x, S-1, pos_base);
     float *last=falloc(D); rmsnorm(last, x+(int64_t)(S-1)*D, m->final_norm, D, c->eps);
@@ -1752,7 +1795,7 @@ static float *step_all(Model *m, const int *ids, int S, int pos_base){
     Cfg *c=&m->c; int D=c->hidden;
     float *x=falloc((int64_t)S*D);
     for(int s=0;s<S;s++) embed_row(m, ids[s], x+(int64_t)s*D);
-    layers_forward(m,x,S,pos_base);
+    { double tl0=now_s(); layers_forward(m,x,S,pos_base); m->t_layers += now_s()-tl0; }
     if(m->h_all) memcpy(m->h_all, x, (int64_t)S*D*sizeof(float));   /* hidden di TUTTE le pos (S<=64) */
     if(m->hlast) memcpy(m->hlast, x+(int64_t)(S-1)*D, D*sizeof(float));
     float *lo=falloc((int64_t)S*c->vocab), *row=falloc(D);
@@ -2117,6 +2160,15 @@ static void profile_print(Model *m, double elapsed){
     printf("PROFILO: expert-disk %.3fs | expert-matmul %.3fs | attention %.3fs "
            "(di cui kvb %.3fs) | lm_head %.3fs | altro %.3fs\n",
         m->t_edisk,m->t_emm,m->t_attn,m->t_kvb,m->t_head,elapsed-accounted);
+    printf("ALTRO  : routing/resolve %.3fs | LRU-promo %.3fs | resto %.3fs\n",
+        m->t_route, m->t_glue, elapsed-accounted-m->t_route-m->t_glue);
+    double moe_known = m->t_edisk + m->t_emm + m->t_route + m->t_glue;
+    printf("BISECT : layers_forward %.3fs = metal-CB(attn) %.3fs + moe %.3fs + resto-layer %.3fs\n"
+           "         dentro moe: noto %.3fs -> GAP-IN-MOE %.3fs\n"
+           "         fuori dai layer (embed/sample/alloc): %.3fs\n",
+        m->t_layers, m->t_attn, m->t_moe, m->t_layers - m->t_attn - m->t_moe,
+        moe_known, m->t_moe - moe_known,
+        elapsed - m->t_layers - m->t_head);
 #ifdef COLI_METAL
     if(g_metal_enabled){ uint64_t ok=0,fb=0,ex=0; double su=0,gp=0,sc=0;
         coli_metal_moe_counts(&ok,&fb,&ex); coli_metal_moe_times(&su,&gp,&sc);

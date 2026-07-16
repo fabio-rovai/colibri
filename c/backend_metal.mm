@@ -400,7 +400,7 @@ extern "C" int coli_metal_matmul(ColiMetalTensor **tp, float *y, const float *x,
 }
 
 // ---- fused decode attention scratch (GLM-5.2 dims) ----
-enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, ANOPE=192, AROWSH=448, AHQH=AHEADS*AQH, AHVH=AHEADS*AVH, AMAXS=4 };
+enum { AH=6144, AHEADS=64, AQLORA=2048, AKVL=512, AROPE=64, AVH=256, AQH=256, ANOPE=192, AROWSH=448, AHQH=AHEADS*AQH, AHVH=AHEADS*AVH, AMAXS=32 };   /* 4 -> 32: consente il PREFILL a chunk sulla GPU (i kernel sono gia' generici in S: mask causale usa PB+s, cache write-back per posizione). Scratch cresce ~8x (aqabs/aclat 4MB, actx 2MB, ascore dinamico) — trascurabile. */
 static id<MTLBuffer> ax_,aqr_,aqf_,acomp_,aqabs_,ascore_,aclat_,actx_,aout_,aqaln_,akvaln_; static size_t ascore_cap;
 static id<MTLBuffer> axr_,anrm_,ash1_,ash2_,ashout_,asig_,aidx_,aw_,akeff_;   // full-layer tail
 static void attn_scratch_init(){
